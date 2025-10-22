@@ -1,0 +1,229 @@
+# =========================
+# تثبيت الحزم بالنسخ المتوافقة
+# =========================
+!pip install --upgrade pip
+!pip install "numpy<1.27,>=1.26.4" "scipy<1.14,>=1.11"
+!pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --extra-index-url https://download.pytorch.org/whl/cpu
+!pip install flask pyngrok pillow transformers==4.41.2 accelerate sentencepiece \
+paddleocr paddlepaddle pytesseract pillow-avif-plugin imageio easyocr scikit-learn --quiet
+!pip uninstall -y tensorflow keras
+
+# =========================
+# الكود
+# =========================
+import os, io, re, threading
+import numpy as np
+import pandas as pd
+from flask import Flask, request, jsonify
+from PIL import Image, ImageOps, ImageFilter
+import torch
+from pyngrok import conf, ngrok
+import imageio.v3 as iio
+import pillow_avif
+import pytesseract
+import easyocr
+from paddleocr import PaddleOCR
+from transformers import (
+    BlipProcessor, BlipForConditionalGeneration,
+    AutoTokenizer, AutoModelForSeq2SeqLM
+)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# إعداد ngrok (ضع التوكن الخاص بك هنا)
+conf.get_default().auth_token = "335mzkMl9IoAcXK9fWoQ6EOtha2_4APGhTGK6FPv3mhY74Phn"
+
+# إعدادات الجهاز
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# تحميل نماذج الوصف والترجمة
+BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
+blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
+blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME).to(DEVICE).eval()
+
+TRANS_MODEL_NAME = "facebook/m2m100_418M"
+trans_tokenizer = AutoTokenizer.from_pretrained(TRANS_MODEL_NAME)
+trans_model = AutoModelForSeq2SeqLM.from_pretrained(TRANS_MODEL_NAME).to(DEVICE).eval()
+
+# OCR
+USE_EASYOCR = True
+if USE_EASYOCR:
+    easy_reader = easyocr.Reader(['ar','en'])
+else:
+    ocr_ar = PaddleOCR(lang='ar')
+    ocr_en = PaddleOCR(lang='en')
+
+# =========================
+# تحميل بيانات المنتجات والتصنيفات
+# =========================
+prod_df = pd.read_csv("/kaggle/input/proddat/prod.csv", on_bad_lines="skip", engine="python")
+prod_df["_search_text"] = (
+    prod_df["title"].fillna("").astype(str) + " " +
+    prod_df["desc"].fillna("").astype(str)
+)
+
+cat_df = pd.read_csv("/kaggle/input/catdat/cat.csv", on_bad_lines="skip", engine="python")
+cat_df["_search_text"] = cat_df["title"].fillna("").astype(str)
+
+# بناء TF-IDF
+prod_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1,2), min_df=1, max_df=0.95)
+prod_tfidf = prod_vectorizer.fit_transform(prod_df["_search_text"])
+
+cat_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1,2), min_df=1, max_df=0.95)
+cat_tfidf = cat_vectorizer.fit_transform(cat_df["_search_text"])
+
+# =========================
+# دوال مساعدة
+# =========================
+def open_image_safe(file):
+    filename = file.filename.lower()
+    data = file.read()
+    file.stream.seek(0)
+    if filename.endswith(".avif"):
+        arr = iio.imread(io.BytesIO(data), extension=".avif")
+        return Image.fromarray(arr).convert("RGB")
+    else:
+        return Image.open(io.BytesIO(data)).convert("RGB")
+
+def caption_image_en(image: Image.Image) -> str:
+    inputs = blip_processor(images=image, return_tensors="pt").to(DEVICE)
+    with torch.no_grad():
+        out_ids = blip_model.generate(**inputs, max_new_tokens=60, num_beams=5)
+    return blip_processor.decode(out_ids[0], skip_special_tokens=True)
+
+def translate_to_arabic(text_en: str) -> str:
+    inputs = trans_tokenizer(text_en, return_tensors="pt", truncation=True).to(DEVICE)
+    forced_bos_token_id = trans_tokenizer.get_lang_id("ar")
+    with torch.no_grad():
+        outputs = trans_model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_new_tokens=120)
+    return trans_tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+def extract_texts_easyocr(image, conf_threshold=0.5):
+    np_img = np.array(image)
+    results = easy_reader.readtext(np_img)
+    return [text.strip() for (bbox, text, conf) in results if conf >= conf_threshold]
+
+def dedup_keywords(tokens):
+    cleaned, seen = [], set()
+    for k in tokens:
+        k = k.strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            cleaned.append(k)
+    return cleaned
+
+def extract_raw_keywords(text, lang="en"):
+    text = re.sub(r"[^\w\s]", " ", text)
+    tokens = text.split()
+    stopwords_en = {"a","an","the","and","or","in","on","at","of","for","with"}
+    stopwords_ar = {"في","على","من","إلى","عن","هو","هي","هم","هن","هذا","هذه"}
+    stopwords = stopwords_en if lang == "en" else stopwords_ar
+    keywords = [t.lower() for t in tokens if t.lower() not in stopwords]
+    return dedup_keywords(keywords)
+
+def split_keywords(keywords, lang="en"):
+    COLORS = {"black","white","red","blue","green","yellow","pink","purple","orange",
+              "gray","silver","gold","beige","brown","navy","maroon","turquoise",
+              "أسود","أبيض","أحمر","أزرق","أخضر","أصفر","وردي","بنفسجي","برتقالي",
+              "رمادي","فضي","ذهبي","بيج","بني","كحلي","قرمزي","فيروزي"}
+    product_name, colors_list, models = [], [], []
+    for kw in keywords:
+        if kw.lower() in COLORS:
+            colors_list.append(kw)
+        elif re.match(r"^[A-Za-z0-9\-]+$", kw) and any(char.isdigit() for char in kw):
+            models.append(kw)
+        else:
+            product_name.append(kw)
+    return {
+        "product_name": product_name[:2],
+        "colors": colors_list,
+        "models": models
+    }
+
+def find_best_matches(query_text, df, vectorizer, tfidf_matrix, id_col, top_k=5):
+    if not query_text.strip():
+        return []
+    query_vec = vectorizer.transform([query_text])
+    sims = cosine_similarity(query_vec, tfidf_matrix).ravel()
+    idxs = sims.argsort()[::-1][:top_k*2]  # نأخذ أكثر من top_k ثم نصفي
+    matches = []
+    for idx in idxs:
+        row = df.iloc[idx]
+        matches.append(int(row[id_col]))
+    # إزالة التكرار مع الحفاظ على الترتيب
+    matches = list(dict.fromkeys(matches))
+    return matches[:top_k]
+
+
+# =========================
+# التحليل الكامل للصورة
+# =========================
+def analyze_image(image: Image.Image):
+    caption_en = caption_image_en(image)
+    caption_ar = translate_to_arabic(caption_en)
+
+    kw_en = extract_raw_keywords(caption_en, lang="en")
+    kw_ar = extract_raw_keywords(caption_ar, lang="ar")
+
+    kw_en_split = split_keywords(kw_en, lang="en")
+    kw_ar_split = split_keywords(kw_ar, lang="ar")
+
+    texts_array = extract_texts_easyocr(image)
+
+    # نص الاستعلام
+    query_text = " ".join([caption_en, caption_ar] + texts_array +
+                          kw_en_split["product_name"] + kw_ar_split["product_name"])
+
+    # البحث في المنتجات والتصنيفات
+    product_ids = find_best_matches(query_text, prod_df, prod_vectorizer, prod_tfidf, "product_id", top_k=5)
+    category_ids = find_best_matches(query_text, cat_df, cat_vectorizer, cat_tfidf, "category_id", top_k=5)
+
+    return {
+        "caption_en": caption_en,
+        "caption_ar": caption_ar,
+        "product_name_en": kw_en_split["product_name"],
+        "product_name_ar": kw_ar_split["product_name"],
+        "colors_en": kw_en_split["colors"],
+        "colors_ar": kw_ar_split["colors"],
+        "models_en": kw_en_split["models"],
+        "models_ar": kw_ar_split["models"],
+        "detected_text_array": texts_array,
+        "closest_product_id": product_ids[0] if product_ids else None,
+        "closest_category_id": category_ids[0] if category_ids else None,
+        "closest_products": product_ids,
+        "closest_categories": category_ids
+    }
+
+
+    
+
+# =========================
+# إعداد Flask
+# =========================
+app = Flask(__name__)
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"message": "🚀 Image Caption + OCR + Product & Category Match API is running"})
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
+    try:
+        file = request.files["image"]
+        image = open_image_safe(file)
+        result = analyze_image(image)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# تشغيل السيرفر مع ngrok
+# =========================
+def run_app():
+    app.run(port=5000, use_reloader=False)
+
+threading.Thread(target=run_app, daemon=True).start()
+public_url = ngrok.connect(5000, bind_tls=True)
+print("📌 الرابط العام:", public_url.public_url)
