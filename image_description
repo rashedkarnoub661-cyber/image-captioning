@@ -1,6 +1,4 @@
-# =========================
-# تثبيت الحزم بالنسخ المتوافقة
-# =========================
+
 !pip install --upgrade pip
 !pip install "numpy<1.27,>=1.26.4" "scipy<1.14,>=1.11"
 !pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --extra-index-url https://download.pytorch.org/whl/cpu
@@ -8,9 +6,7 @@
 paddleocr paddlepaddle pytesseract pillow-avif-plugin imageio easyocr scikit-learn --quiet
 !pip uninstall -y tensorflow keras
 
-# =========================
-# الكود
-# =========================
+
 import os, io, re, threading
 import numpy as np
 import pandas as pd
@@ -30,13 +26,13 @@ from transformers import (
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# إعداد ngrok (ضع التوكن الخاص بك هنا)
+
 conf.get_default().auth_token = "335mzkMl9IoAcXK9fWoQ6EOtha2_4APGhTGK6FPv3mhY74Phn"
 
-# إعدادات الجهاز
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# تحميل نماذج الوصف والترجمة
+
 BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 blip_processor = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
 blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME).to(DEVICE).eval()
@@ -45,7 +41,7 @@ TRANS_MODEL_NAME = "facebook/m2m100_418M"
 trans_tokenizer = AutoTokenizer.from_pretrained(TRANS_MODEL_NAME)
 trans_model = AutoModelForSeq2SeqLM.from_pretrained(TRANS_MODEL_NAME).to(DEVICE).eval()
 
-# OCR
+
 USE_EASYOCR = True
 if USE_EASYOCR:
     easy_reader = easyocr.Reader(['ar','en'])
@@ -53,9 +49,7 @@ else:
     ocr_ar = PaddleOCR(lang='ar')
     ocr_en = PaddleOCR(lang='en')
 
-# =========================
-# تحميل بيانات المنتجات والتصنيفات
-# =========================
+
 prod_df = pd.read_csv("/kaggle/input/proddat/prod.csv", on_bad_lines="skip", engine="python")
 prod_df["_search_text"] = (
     prod_df["title"].fillna("").astype(str) + " " +
@@ -72,9 +66,7 @@ prod_tfidf = prod_vectorizer.fit_transform(prod_df["_search_text"])
 cat_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1,2), min_df=1, max_df=0.95)
 cat_tfidf = cat_vectorizer.fit_transform(cat_df["_search_text"])
 
-# =========================
-# دوال مساعدة
-# =========================
+
 def open_image_safe(file):
     filename = file.filename.lower()
     data = file.read()
@@ -150,14 +142,12 @@ def find_best_matches(query_text, df, vectorizer, tfidf_matrix, id_col, top_k=5)
     for idx in idxs:
         row = df.iloc[idx]
         matches.append(int(row[id_col]))
-    # إزالة التكرار مع الحفاظ على الترتيب
+
     matches = list(dict.fromkeys(matches))
     return matches[:top_k]
 
 
-# =========================
-# التحليل الكامل للصورة
-# =========================
+
 def analyze_image(image: Image.Image):
     caption_en = caption_image_en(image)
     caption_ar = translate_to_arabic(caption_en)
@@ -170,11 +160,11 @@ def analyze_image(image: Image.Image):
 
     texts_array = extract_texts_easyocr(image)
 
-    # نص الاستعلام
+
     query_text = " ".join([caption_en, caption_ar] + texts_array +
                           kw_en_split["product_name"] + kw_ar_split["product_name"])
 
-    # البحث في المنتجات والتصنيفات
+
     product_ids = find_best_matches(query_text, prod_df, prod_vectorizer, prod_tfidf, "product_id", top_k=5)
     category_ids = find_best_matches(query_text, cat_df, cat_vectorizer, cat_tfidf, "category_id", top_k=5)
 
@@ -197,9 +187,7 @@ def analyze_image(image: Image.Image):
 
     
 
-# =========================
-# إعداد Flask
-# =========================
+
 app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
@@ -218,9 +206,7 @@ def analyze():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# =========================
-# تشغيل السيرفر مع ngrok
-# =========================
+
 def run_app():
     app.run(port=5000, use_reloader=False)
 
